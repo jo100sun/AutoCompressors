@@ -33,6 +33,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers import GenerationMixin
 
 from flash_attn import flash_attn_kvpacked_func, flash_attn_varlen_kvpacked_func
 from flash_attn.bert_padding import unpad_input, pad_input
@@ -294,6 +295,18 @@ class LlamaAttention(nn.Module):
         if has_layer_past:
             past_kv = past_key_value[0]
             past_len = past_key_value[1]
+            
+            if past_len is None:
+                if torch.is_tensor(past_kv):
+                    # past_kv shape: (bs, seqlen, 2, nheads, headdim) 같은 형태를 가정
+                    past_len = int(past_kv.size(1))
+                else:
+                    past_len = 0
+
+            # 2) past_kv 자체가 None이면 캐시 없음으로 간주
+            if past_kv is None:
+                has_layer_past = False
+                past_len = 0
         else:
             past_len = 0
 
@@ -426,7 +439,7 @@ class LlamaDecoderLayer(nn.Module):
         return outputs
 
 
-class LlamaPreTrainedModel(PreTrainedModel):
+class LlamaPreTrainedModel(GenerationMixin, PreTrainedModel):
     config_class = LlamaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
