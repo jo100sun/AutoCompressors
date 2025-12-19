@@ -128,7 +128,17 @@ class AutoCompressorMixin:
         return outputs, segment_last_hiddens, new_softprompt
 
     def get_past_key_values_len(self, past_key_values):
-        return 0 if past_key_values is None else past_key_values[0][0].size(2)
+        if past_key_values is None:
+            return 0
+        try:
+            v = past_key_values[0][1]
+            if v is None:
+                # 텐서 기반 복원 시도
+                pkv = past_key_values[0][0]
+                return int(pkv.size(2)) if torch.is_tensor(pkv) else 0
+            return int(v)
+        except Exception:
+            return 0
 
     def forward(
         self,
@@ -145,14 +155,13 @@ class AutoCompressorMixin:
         segment_lengths: Optional[Union[List[int], int]] = None,
         softprompt: Optional[torch.FloatTensor] = None,
         output_softprompt: Optional[bool] = None,
+        past_key_values_softprompt_length: int = 0,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        # We formulate the past_key_values as a tuple where the second entry is the softprompt already in the past key values
+        # Support legacy dict-shaped past_key_values while preferring tuples for newer transformers versions
         if past_key_values is not None and isinstance(past_key_values, dict):
-            # Replace softprompt in direct argument with the softprompt in past_key_values
-            past_key_values, softprompt = past_key_values["past_key_values"], past_key_values["softprompt"]
-            past_key_values_softprompt_length = softprompt.size(1)
-        else:
-            past_key_values_softprompt_length = 0
+            past_key_values, softprompt = past_key_values["past_key_values"], past_key_values.get("softprompt", softprompt)
+            if softprompt is not None:
+                past_key_values_softprompt_length = max(past_key_values_softprompt_length, softprompt.size(1))
 
         past_key_values_length = self.get_past_key_values_len(past_key_values) - past_key_values_softprompt_length
 
@@ -258,7 +267,7 @@ class AutoCompressorMixin:
         output = CausalACOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values={"past_key_values": past_key_values, "softprompt": softprompt},
+            past_key_values=past_key_values,
             hidden_states=output_hidden_states_list if output_hidden_states_list[0] is not None else None,
             attentions=output_attentions_list if output_attentions_list[0] is not None else None,
             softprompt=softprompt,
@@ -272,10 +281,28 @@ class AutoCompressorMixin:
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
-        model_inputs = super().prepare_inputs_for_generation(input_ids, past_key_values, attention_mask, inputs_embeds, **kwargs)
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids, past_key_values, attention_mask, inputs_embeds, **kwargs
+        )
         model_inputs["softprompt"] = kwargs.get("softprompt", None)
         model_inputs["segment_lengths"] = kwargs.get("segment_lengths", None)
+        model_inputs["past_key_values_softprompt_length"] = kwargs.get("past_key_values_softprompt_length", 0)
         return model_inputs
+
+    def _update_model_kwargs_for_generation(
+        self, outputs, model_kwargs: Dict[str, torch.Tensor], is_encoder_decoder: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        model_kwargs = super()._update_model_kwargs_for_generation(outputs, model_kwargs, is_encoder_decoder)
+
+        softprompt = getattr(outputs, "softprompt", None)
+        if softprompt is not None:
+            model_kwargs["softprompt"] = softprompt
+            model_kwargs["past_key_values_softprompt_length"] = softprompt.size(1)
+        else:
+            model_kwargs.pop("softprompt", None)
+            model_kwargs.pop("past_key_values_softprompt_length", None)
+
+        return model_kwargs
 
 
 class OPTLearnedPositionalEmbeddingWithPadding(nn.Embedding):
@@ -337,4 +364,14 @@ class LlamaAutoCompressorModel(AutoCompressorMixin, LlamaForCausalLM):
 
     def get_past_key_values_len(self, past_key_values):
         # modeling_flash_llama has slightly different layout of past key vlaues
-        return 0 if past_key_values is None else past_key_values[0][1]
+        if past_key_values is None:
+            return 0
+        try:
+            v = past_key_values[0][1]
+            if v is None:
+                # 텐서 기반 복원 시도
+                pkv = past_key_values[0][0]
+                return int(pkv.size(1)) if torch.is_tensor(pkv) else 0
+            return int(v)
+        except Exception:
+            return 0
