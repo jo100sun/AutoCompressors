@@ -99,9 +99,18 @@ model = OPTAutoCompressorModel.from_pretrained("princeton-nlp/AutoCompressor-2.7
 
 ### Summary Vectors
 
-The summary vectors for a given context can be obtained in two ways:
-1. **Explicitly:** Call the model with `out = model(input_ids, attention_mask, ..., output_softprompt=True)` and obtain the summary vectors as `summary_vectors = out.softprompt` which can be passed to further calls by `model(..., softprompt=sumary_vectors)`.
-2. **Implicitly:** Call the model with `out = model(input_ids, segment_lengths=segment_lengths)`, where `segment_lengths` is a list of integers that should add up to the overall sequence length `input_ids.size(1)`. After each segment, the model will automatically generate the summary vectors and prepend them to the next segment. This can still be combined with `output_softprompt=True` to generate the final summary vectors for the entire input. This is convenient for multi-step compression of long inputs, which would otherwise exceed the model's maximum position.
+The variable-length AutoCompressor uses two control tokens:
+
+* `<sum>` – appended by the data pipeline at the end of each segment to trigger compression.
+* `<eoc>` – emitted internally to stop compression. It is never exposed as visible text.
+
+At training time, compression runs for `compression_max_len` steps with differentiable stopping; at inference time the loop stops once `<eoc>` is predicted (or once `compression_max_len` is reached), yielding a softprompt whose length can vary across segments.
+
+You can obtain the softprompt memory in two ways:
+1. **Explicitly:** Call the model with `out = model(input_ids, attention_mask, ..., output_softprompt=True)` and read `summary_vectors = out.softprompt`. This returns the most recent compression memory and can be passed back in with `model(..., softprompt=summary_vectors)`.
+2. **Implicitly:** Call `out = model(input_ids, segment_lengths=segment_lengths)`, where `segment_lengths` is a list of integers that add up to `input_ids.size(1)` and each segment already contains a final `<sum>` token. After every segment the model recompresses the current memory and prepends it to the next segment. `output_softprompt=True` will still return the final memory for inspection or reuse.
+
+When preparing data, make sure `<sum>` is inserted where compression should occur; `<eoc>` should never appear in labels or generated text and is handled internally by the model.
 
 ## Bug or Questions?
 If you have any questions related to the code or the paper, feel free to email

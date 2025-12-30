@@ -10,10 +10,13 @@ save_steps=${SAVE:-5000}
 num_gpus=${NUM_GPUS:-1}
 segments_per_substep=${SEG:-2}
 training_substeps=${SUB:-2}
-summary_length=${SUM:-50}
+compression_max_len=${CML:-8}
+compression_lambda=${CLAMBDA:-0.0}
+compression_alpha=${CALPHA:-1.0}
+truncate_bptt_segments=${TBPTT:-1}
+compress_stop_threshold=${CSTOP:-}
 num_nodes=${NUM_NODES:-1}
 node=${NODE:-"localhost"}
-summary_accumulation=${ACC:-true}
 randomize_substeps=${RAND:-true}
 segment_gradient_checkpointing=${CHECK:-false}
 num_train_epochs=1
@@ -26,12 +29,9 @@ eval_domains=(Books3 Github FreeLaw Wikipedia Gutenberg HackerNews ArXiv Youtube
 total_per_device=$((${total}/${num_gpus}/${num_nodes}))
 accu=$(( ${total_per_device} / ${bs} ))
 
-run_name_suffix="sub${training_substeps}_seg${segments_per_substep}_sum${summary_length}_lr${lr}_bsz${total}"
+run_name_suffix="sub${training_substeps}_seg${segments_per_substep}_cml${compression_max_len}_lr${lr}_bsz${total}"
 if [[ ${randomize_substeps} == true ]]; then
     run_name_suffix+="_rand"
-fi
-if [[ $summary_accumulation == true ]]; then
-    run_name_suffix+="_accu"
 fi
 if [[ ${segment_gradient_checkpointing} == true ]]; then
     run_name+="_check"
@@ -80,8 +80,10 @@ arguments=(
     --learning_rate $lr
     --run_name $run_name
     --output_dir $out_dir
-    --summary_length $summary_length
-    --accumulate_summary $summary_accumulation
+    --compression_max_len $compression_max_len
+    --compression_lambda $compression_lambda
+    --compression_alpha $compression_alpha
+    --truncate_bptt_segments $truncate_bptt_segments
     --remove_unused_columns false
     --segments_per_substep $segments_per_substep
     --training_substeps $training_substeps
@@ -94,9 +96,12 @@ arguments=(
     --lora_dropout 0.05
     --lora_target_modules q_proj v_proj o_proj k_proj
     --use_fast_tokenizer false
-    --lora_modules_to_save embed_summary
     $@
 )
+
+if [[ -n "$compress_stop_threshold" ]]; then
+    arguments+=(--compress_stop_threshold $compress_stop_threshold)
+fi
 
 echo "Training on 6K token sequences"
 arguments+=(--preprocessed_train_datasets awettig/RedPajama-combined-15B-6K-llama)
