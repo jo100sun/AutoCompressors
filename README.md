@@ -99,6 +99,8 @@ model = OPTAutoCompressorModel.from_pretrained("princeton-nlp/AutoCompressor-2.7
 
 ### Summary Vectors
 
+AutoCompressors now operate in a variable-length compression mode driven by two control tokens: `<sum>` triggers compression and `<eoc>` terminates it. During compression the model emits a sequence of continuous vectors (no text tokens) which becomes the softprompt for the next segment. The compression loop stops when `<eoc>` is predicted (inference) or by a differentiable gate (training), and the expected length can be regularized via `--compression_lambda`.
+
 The summary vectors for a given context can be obtained in two ways:
 1. **Explicitly:** Call the model with `out = model(input_ids, attention_mask, ..., output_softprompt=True)` and obtain the summary vectors as `summary_vectors = out.softprompt` which can be passed to further calls by `model(..., softprompt=sumary_vectors)`.
 2. **Implicitly:** Call the model with `out = model(input_ids, segment_lengths=segment_lengths)`, where `segment_lengths` is a list of integers that should add up to the overall sequence length `input_ids.size(1)`. After each segment, the model will automatically generate the summary vectors and prepend them to the next segment. This can still be combined with `output_softprompt=True` to generate the final summary vectors for the entire input. This is convenient for multi-step compression of long inputs, which would otherwise exceed the model's maximum position.

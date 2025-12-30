@@ -23,8 +23,8 @@ warmup_steps=${WU:-5000}
 save_steps=${SAVE:-5000}
 segments_per_substep=${SEG:-2}
 training_substeps=${SUB:-1}
-summary_length=${SUM:-50}
-summary_accumulation=${ACC:-true}
+compression_max_len=${COMP_LEN:-8}
+compression_lambda=${COMP_LAMBDA:-0.0}
 randomize_substeps=${RAND:-false}
 num_train_epochs=1
 segment_lengths=${SEGLEN:-"2048 2048"}
@@ -90,8 +90,8 @@ arguments=(
     --learning_rate $lr
     --output_dir $out_dir
     --use_fast_tokenizer false
-    --summary_length $summary_length
-    --accumulate_summary $summary_accumulation
+    --compression_max_len $compression_max_len
+    --compression_lambda $compression_lambda
     --remove_unused_columns false
     --segments_per_substep $segments_per_substep
     --training_substeps $training_substeps
