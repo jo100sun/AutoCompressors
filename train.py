@@ -135,6 +135,14 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
+    special_tokens = []
+    if tokenizer.convert_tokens_to_ids("<sum>") is None:
+        special_tokens.append("<sum>")
+    if tokenizer.convert_tokens_to_ids("<eoc>") is None:
+        special_tokens.append("<eoc>")
+    if special_tokens:
+        tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
+
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
@@ -155,9 +163,15 @@ def main():
         logger.info(f"New config: {config}")
 
     # Update config with AutoCompressor parameters
-    config.summary_length = training_args.summary_length
-    config.accumulate_summary = training_args.accumulate_summary
+    config.compression_max_len = training_args.compression_max_len
+    config.compression_lambda = training_args.compression_lambda
+    config.compression_alpha = training_args.compression_alpha
     config.segment_gradient_checkpointing = training_args.segment_gradient_checkpointing
+    config.truncate_bptt_segments = training_args.truncate_bptt_segments
+    config.compress_stop_threshold = training_args.compress_stop_threshold
+
+    config.sum_token_id = tokenizer.convert_tokens_to_ids("<sum>")
+    config.eoc_token_id = tokenizer.convert_tokens_to_ids("<eoc>")
 
     # Create model
     if "llama" in (model_args.model_name_or_path or model_args.config_name).lower():
@@ -181,6 +195,8 @@ def main():
         model = AutoCompressorModel.from_config(config)
         n_params = sum(dict((p.data_ptr(), p.numel()) for p in model.parameters()).values())
         logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
+
+    model.resize_token_embeddings(len(tokenizer))
 
     # Extend positional embeddings
     if training_args.max_position_embeddings is not None:

@@ -13,7 +13,7 @@
 nvidia-smi
 conda activate auto
 base_model=${BASE:-"Llama-2-7b-hf"}
-run_name=${NAME:-"ac_Llama-2-7b-hf_sub2_seg2_sum50_lr4e-4_bsz32_rand_accu/checkpoint-65000"}    # use llama-2-7b-hf for base model
+run_name=${NAME:-"ac_Llama-2-7b-hf_sub2_seg2_cml8_lr4e-4_bsz32_rand/checkpoint-65000"}    # use llama-2-7b-hf for base model
 block_size=${BLOCK:-8192}
 
 total=${BATCH:-32}      # total batch size
@@ -23,8 +23,11 @@ warmup_steps=${WU:-5000}
 save_steps=${SAVE:-5000}
 segments_per_substep=${SEG:-2}
 training_substeps=${SUB:-1}
-summary_length=${SUM:-50}
-summary_accumulation=${ACC:-true}
+compression_max_len=${CML:-8}
+compression_lambda=${CLAMBDA:-0.0}
+compression_alpha=${CALPHA:-1.0}
+truncate_bptt_segments=${TBPTT:-1}
+compress_stop_threshold=${CSTOP:-}
 randomize_substeps=${RAND:-false}
 num_train_epochs=1
 segment_lengths=${SEGLEN:-"2048 2048"}
@@ -90,8 +93,10 @@ arguments=(
     --learning_rate $lr
     --output_dir $out_dir
     --use_fast_tokenizer false
-    --summary_length $summary_length
-    --accumulate_summary $summary_accumulation
+    --compression_max_len $compression_max_len
+    --compression_lambda $compression_lambda
+    --compression_alpha $compression_alpha
+    --truncate_bptt_segments $truncate_bptt_segments
     --remove_unused_columns false
     --segments_per_substep $segments_per_substep
     --training_substeps $training_substeps
@@ -103,6 +108,10 @@ arguments=(
     --rope_theta ${rope_theta}
     $@
 )
+
+if [[ -n "$compress_stop_threshold" ]]; then
+    arguments+=(--compress_stop_threshold $compress_stop_threshold)
+fi
 
 echo "Evaluating on ${block_size} token sequences"
 data="preprocessed_redpajama-weighted-disjoint_${block_size}"
