@@ -135,6 +135,11 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
+    special_tokens = ["<sum>", "<eoc>"]
+    tokens_to_add = [tok for tok in special_tokens if tok not in tokenizer.get_vocab()]
+    if tokens_to_add:
+        tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
+
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
@@ -154,9 +159,14 @@ def main():
         config.update_from_string(model_args.config_overrides)
         logger.info(f"New config: {config}")
 
+    config.sum_token_id = tokenizer.convert_tokens_to_ids("<sum>")
+    config.eoc_token_id = tokenizer.convert_tokens_to_ids("<eoc>")
+
     # Update config with AutoCompressor parameters
-    config.summary_length = training_args.summary_length
-    config.accumulate_summary = training_args.accumulate_summary
+    config.compression_max_len = training_args.compression_max_len
+    config.compression_lambda = training_args.compression_lambda
+    config.recompress_memory = training_args.recompress_memory
+    config.truncate_bptt_segments = training_args.truncate_bptt_segments
     config.segment_gradient_checkpointing = training_args.segment_gradient_checkpointing
 
     # Create model
@@ -181,6 +191,8 @@ def main():
         model = AutoCompressorModel.from_config(config)
         n_params = sum(dict((p.data_ptr(), p.numel()) for p in model.parameters()).values())
         logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
+
+    model.resize_token_embeddings(len(tokenizer))
 
     # Extend positional embeddings
     if training_args.max_position_embeddings is not None:

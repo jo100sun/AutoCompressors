@@ -12,14 +12,21 @@ class TrainingArguments(HfTrainingArguments):
         default=None,
         metadata={"help": "The maximum position embedding per segment."}
     )
-    summary_length: int = field(
+    compression_max_len: int = field(
         default=0,
-        metadata={"help": "Number of summary tokens. 0 allocates no space for summary tokens."}
+        metadata={"help": "Maximum number of compression steps (training unroll length)."}
     )
-    accumulate_summary: bool = field(
-        default=False,
-        metadata={"help": "If True, summary tokens of all past segments will be accumulated "
-                          "when passed to the next segment."}
+    compression_lambda: float = field(
+        default=0.0,
+        metadata={"help": "Length penalty weight for expected compression length."}
+    )
+    recompress_memory: bool = field(
+        default=True,
+        metadata={"help": "If True, replace memory after each segment compression."}
+    )
+    truncate_bptt_segments: int = field(
+        default=1,
+        metadata={"help": "Detach compressed memory every N segments to truncate backprop."}
     )
 
     training_substeps: Optional[int] = field(

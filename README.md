@@ -41,6 +41,17 @@ print("Generation w/o context:\n" + tokenizer.decode(next_tokens_without_context
 # >>> The first name of the current US president is "Donald" and the last name is "Trump".
 ```
 
+### Variable-length compression
+
+AutoCompressors now use explicit control tokens to trigger compression and termination:
+
+- `<sum>` is a trainable trigger token that is inserted by the data pipeline at the end of each segment to request compression.
+- `<eoc>` is a distinct trainable token that signals the end of compression steps. It is *not* part of the visible token stream and is never prepended to the next segment.
+
+During training, the model always unrolls `compression_max_len` compression steps after reading `<sum>`, producing continuous vectors `z_1..z_L` which are gated by the learned probability of predicting `<eoc>`. These gated vectors become the next segment's soft prompt, and a length penalty weighted by `compression_lambda` encourages short summaries relative to the pre-compression context length. At inference time, the compression loop runs until the model greedily predicts `<eoc>` or the maximum length is reached, using the collected `z_t` vectors as the soft prompt for the next segment.
+
+To recompress long sequences, split the text into segments, append `<sum>` to each segment boundary, and pass the resulting `input_ids` to `model(..., segment_lengths=...)`. The returned `softprompt` field contains the new memory that is prepended (as a soft prompt) to the following segment.
+
 ### Install
 Setup a new environment and install [pytorch](https://pytorch.org/) version 2.1.0,
 followed by these libraries
