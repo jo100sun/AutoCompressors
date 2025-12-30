@@ -1,5 +1,4 @@
 import logging
-import os
 from typing import Optional, Union, List, Tuple, Dict
 from dataclasses import dataclass
 
@@ -9,97 +8,95 @@ import torch.nn.functional as F
 
 from transformers import OPTForCausalLM
 from modeling_flash_llama import LlamaForCausalLM
-
 from transformers.modeling_outputs import CausalLMOutputWithPast
-
-import os
 
 logger = logging.getLogger(__name__)
 
 PastKVType = Optional[Tuple[Tuple[torch.FloatTensor]]]
 
+
 @dataclass
 class SummaryConfig:
     """Keep track of token constitution of current input sequence"""
+
     softprompt_length: int = 0
     past_key_values_softprompt_length: int = 0
-    summary_length: int = 0
+    control_length: int = 0
 
     def reset(self):
         self.softprompt_length = 0
         self.past_key_values_softprompt_length = 0
-        self.summary_length = 0
+        self.control_length = 0
 
 
 @dataclass
 class CausalACOutputWithPast(CausalLMOutputWithPast):
-    softprompt: Optional[torch.FloatTensor]= None
+    softprompt: Optional[torch.FloatTensor] = None
 
 
 class AutoCompressorMixin:
     """Mixin class to turn a AutoModelForCausalLM into an AutoCompressor."""
 
     def setup_autocompressor(self, config):
-        """Call this function in the subclass __init__ to initialize the autocompressor. Override for custom behaviour"""
-        assert hasattr(self.config, 'summary_length'), "Compressor requires a summary_length config parameter"
+        # Defaults for variable-length compression
+        if not hasattr(config, "compression_max_len"):
+            config.compression_max_len = 0
+        if not hasattr(config, "compression_lambda"):
+            config.compression_lambda = 0.0
+        if not hasattr(config, "recompress_memory"):
+            config.recompress_memory = True
+        if not hasattr(config, "truncate_bptt_segments"):
+            config.truncate_bptt_segments = 1
+        if not hasattr(config, "sum_token_id"):
+            config.sum_token_id = None
+        if not hasattr(config, "eoc_token_id"):
+            config.eoc_token_id = None
+
+        if config.sum_token_id is None or config.eoc_token_id is None:
+            logger.warning(
+                "AutoCompressor config is missing sum/eoc token ids; ensure tokenizer is updated before use."
+            )
 
         self.summary_config = SummaryConfig()
 
-        if config.summary_length > 0:
-            self.embed_summary = nn.Embedding(config.summary_length, self.get_input_embeddings().embedding_dim)
+    # ------------------------------------------------
+    # Helpers
+    # ------------------------------------------------
+    def get_sum_embedding(self, device, dtype):
+        if self.config.sum_token_id is None:
+            raise ValueError("sum_token_id must be set on config")
+        token = torch.tensor([self.config.sum_token_id], device=device)
+        return self.get_input_embeddings()(token).to(dtype)
 
-            input_embeds = self.get_input_embeddings()
-            self.embed_summary.weight.data[:,:] = (
-                input_embeds.weight[config.eos_token_id]
-            )
+    def get_past_key_values_len(self, past_key_values):
+        if past_key_values is None:
+            return 0
+        try:
+            v = past_key_values[0][1]
+            if v is None:
+                pkv = past_key_values[0][0]
+                return int(pkv.size(2)) if torch.is_tensor(pkv) else 0
+            return int(v)
+        except Exception:
+            return 0
 
-    def forward_segment(
+    def _decoder(
         self,
-        softprompt: torch.FloatTensor,
-        segment_embeds: torch.FloatTensor,
-        summary_token_embeds: torch.FloatTensor,
-        segment_attention_mask: torch.LongTensor,
+        inputs_embeds: torch.FloatTensor,
+        attention_mask: torch.LongTensor,
         past_key_values: PastKVType,
         output_hidden_states: bool,
         use_cache: bool,
         output_attentions: bool,
-        segment_gradient_checkpointing: bool,
-        past_key_values_softprompt_length: int
+        softprompt_length: int,
+        past_key_values_softprompt_length: int,
+        control_length: int = 0,
+        segment_gradient_checkpointing: bool = False,
     ):
-
-        bsz = segment_embeds.size(0)
-        summary_length = summary_token_embeds.size(1)
-        if past_key_values_softprompt_length > 0: # Softprompt should already be in past_key_values
-            softprompt_length = 0
-            segment_embeds = torch.cat([segment_embeds, summary_token_embeds], dim=1)
-
-            device, attn_dtype = segment_embeds.device, segment_attention_mask.dtype
-            segment_attention_mask = torch.cat([
-                torch.ones(bsz, past_key_values_softprompt_length, device=device, dtype=attn_dtype),
-                segment_attention_mask,
-                torch.ones(bsz, summary_length, device=device, dtype=attn_dtype)
-            ], dim=1)
-        else:
-            softprompt_length = softprompt.size(1)
-            segment_embeds = torch.cat([softprompt, segment_embeds, summary_token_embeds], dim=1)
-
-            device, attn_dtype = segment_embeds.device, segment_attention_mask.dtype
-            segment_attention_mask = torch.cat([
-                torch.ones(bsz, softprompt_length, device=device, dtype=attn_dtype),
-                segment_attention_mask,
-                torch.ones(bsz, summary_length, device=device, dtype=attn_dtype)
-            ], dim=1)
-        
-        def decoder(segment_embeds,
-                    segment_attention_mask,
-                    segment_past_key_values,
-                    softprompt_length,
-                    past_key_values_softprompt_length,
-                    summary_length):
-            self.summary_config.softprompt_length = softprompt_length
-            self.summary_config.past_key_values_softprompt_length = past_key_values_softprompt_length
-            self.summary_config.summary_length = summary_length
-
+        def _run(segment_embeds, segment_attention_mask, segment_past_key_values, soft_len, past_soft_len, ctrl_len):
+            self.summary_config.softprompt_length = soft_len
+            self.summary_config.past_key_values_softprompt_length = past_soft_len
+            self.summary_config.control_length = ctrl_len
             return self.model(
                 inputs_embeds=segment_embeds,
                 attention_mask=segment_attention_mask,
@@ -107,28 +104,129 @@ class AutoCompressorMixin:
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
-                return_dict=True,)
+                return_dict=True,
+            )
 
         if segment_gradient_checkpointing:
-            outputs = torch.utils.checkpoint.checkpoint(
-                decoder, segment_embeds, segment_attention_mask, past_key_values,
-                softprompt_length, past_key_values_softprompt_length, summary_length,
-                use_reentrant=False)
-        else:
-            outputs = decoder(
-                segment_embeds, segment_attention_mask, past_key_values,
-                softprompt_length, past_key_values_softprompt_length, summary_length)
-
-        total_length = outputs.last_hidden_state.size(1)
-        segment_last_hiddens = (
-            outputs.last_hidden_state[:, softprompt_length:total_length - summary_length]
+            return torch.utils.checkpoint.checkpoint(
+                _run,
+                inputs_embeds,
+                attention_mask,
+                past_key_values,
+                softprompt_length,
+                past_key_values_softprompt_length,
+                control_length,
+                use_reentrant=False,
+            )
+        return _run(
+            inputs_embeds,
+            attention_mask,
+            past_key_values,
+            softprompt_length,
+            past_key_values_softprompt_length,
+            control_length,
         )
-        new_softprompt = outputs.last_hidden_state[:, total_length - summary_length:]
 
-        return outputs, segment_last_hiddens, new_softprompt
+    def _compress_context(
+        self,
+        prefix_outputs,
+        attention_mask: torch.LongTensor,
+        past_key_values_softprompt_length: int,
+        original_length: int,
+        training: bool = True,
+    ):
+        """Run variable-length compression loop starting after <sum>.
 
-    def get_past_key_values_len(self, past_key_values):
-        return 0 if past_key_values is None else past_key_values[0][0].size(2)
+        Returns
+        -------
+        new_softprompt: torch.FloatTensor
+            Memory vectors to prepend to the next segment.
+        stats: Dict
+            Contains probabilities and expected length (training only).
+        """
+
+        if self.config.compression_max_len <= 0:
+            return prefix_outputs.last_hidden_state[:, :0, :], {}
+        if self.config.eoc_token_id is None:
+            raise ValueError("eoc_token_id must be set on config")
+
+        past_key_values = prefix_outputs.past_key_values
+        z_prev = prefix_outputs.last_hidden_state[:, -1:, :]
+        attn_mask = torch.cat(
+            [attention_mask, torch.ones(attention_mask.size(0), 1, device=attention_mask.device, dtype=attention_mask.dtype)],
+            dim=1,
+        )
+
+        prob_list = []
+        survival_list = []
+        memory_vectors = []
+        expected_length = None
+
+        survival = torch.ones(z_prev.size(0), 1, 1, device=z_prev.device, dtype=z_prev.dtype)
+
+        for step in range(self.config.compression_max_len):
+            self.summary_config.softprompt_length = 0
+            self.summary_config.past_key_values_softprompt_length = past_key_values_softprompt_length
+            self.summary_config.control_length = 0
+
+            step_outputs = self.model(
+                inputs_embeds=z_prev,
+                attention_mask=attn_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+
+            z_t = step_outputs.last_hidden_state[:, -1:, :]
+            logits = self.lm_head(z_t)
+            p_t = logits.softmax(dim=-1)[..., self.config.eoc_token_id]
+            prob_list.append(p_t)
+            if training:
+                survival_list.append(survival)
+                memory_vectors.append(survival * z_t)
+                survival = survival * (1 - p_t.unsqueeze(-1))
+            else:
+                token_id = logits.argmax(dim=-1)
+                stop_mask = token_id.eq(self.config.eoc_token_id)
+                if not torch.any(stop_mask):
+                    memory_vectors.append(z_t)
+                else:
+                    keep_mask = ~stop_mask
+                    if torch.any(keep_mask):
+                        memory_vectors.append(z_t * keep_mask.unsqueeze(-1).type_as(z_t))
+                    break
+
+            z_prev = z_t
+            past_key_values = step_outputs.past_key_values
+            attn_mask = torch.cat(
+                [attn_mask, torch.ones(attn_mask.size(0), 1, device=attn_mask.device, dtype=attn_mask.dtype)], dim=1
+            )
+
+        if training:
+            if len(memory_vectors) > 0:
+                new_softprompt = torch.cat(memory_vectors, dim=1)
+            else:
+                new_softprompt = z_prev[:, :0, :]
+            if len(survival_list) > 0:
+                survival_tensor = torch.cat(survival_list, dim=1)
+                expected_length = survival_tensor.sum(dim=1)  # [B,1]
+            else:
+                survival_tensor = None
+                expected_length = None
+        else:
+            new_softprompt = torch.cat(memory_vectors, dim=1) if len(memory_vectors) > 0 else z_prev[:, :0, :]
+            survival_tensor = None
+
+        stats = {
+            "p_eoc": torch.stack(prob_list, dim=1) if len(prob_list) > 0 else None,
+            "survival": survival_tensor,
+            "expected_length": expected_length,
+            "original_length": original_length,
+        }
+
+        return new_softprompt, stats
 
     def forward(
         self,
@@ -145,14 +243,12 @@ class AutoCompressorMixin:
         segment_lengths: Optional[Union[List[int], int]] = None,
         softprompt: Optional[torch.FloatTensor] = None,
         output_softprompt: Optional[bool] = None,
+        past_key_values_softprompt_length: int = 0,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        # We formulate the past_key_values as a tuple where the second entry is the softprompt already in the past key values
         if past_key_values is not None and isinstance(past_key_values, dict):
-            # Replace softprompt in direct argument with the softprompt in past_key_values
-            past_key_values, softprompt = past_key_values["past_key_values"], past_key_values["softprompt"]
-            past_key_values_softprompt_length = softprompt.size(1)
-        else:
-            past_key_values_softprompt_length = 0
+            past_key_values, softprompt = past_key_values["past_key_values"], past_key_values.get("softprompt", softprompt)
+            if softprompt is not None:
+                past_key_values_softprompt_length = max(past_key_values_softprompt_length, softprompt.size(1))
 
         past_key_values_length = self.get_past_key_values_len(past_key_values) - past_key_values_softprompt_length
 
@@ -166,16 +262,10 @@ class AutoCompressorMixin:
         if inputs_embeds is None and input_ids is not None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        if self.config.summary_length > 0:
-            summary_token_ids = torch.arange(self.config.summary_length, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0).expand(inputs_embeds.size(0), -1)
-            summary_token_embeds = self.embed_summary(summary_token_ids).to(inputs_embeds.dtype)
-        else:
-            summary_token_embeds = inputs_embeds[:,:0]
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
 
-        # If no past_key_values are given, we will process the sequence in multiple segments
         if past_key_values is None:
             segment_lengths = segment_lengths if segment_lengths is not None else input_ids.size(1)
-
             if attention_mask is None:
                 attention_mask = torch.ones(
                     inputs_embeds.size(0), inputs_embeds.size(1), dtype=torch.long, device=inputs_embeds.device
@@ -183,85 +273,136 @@ class AutoCompressorMixin:
 
             inputs_embeds_list = torch.split(inputs_embeds, segment_lengths, dim=1)
             attention_mask_list = torch.split(attention_mask, segment_lengths, dim=1)
-            summary_token_embeds_list = (
-                (summary_token_embeds,) * (len(inputs_embeds_list) - 1) +
-                (summary_token_embeds if output_softprompt else summary_token_embeds[:,:0,:],)
-            )
-        # With past_key_values we will process the input in a single pass (for generation), except when generting summary vectors
         else:
             if attention_mask is None:
                 attention_mask = torch.ones(
                     inputs_embeds.size(0), inputs_embeds.size(1) + past_key_values_length, dtype=torch.long, device=inputs_embeds.device
                 )
+            inputs_embeds_list = (inputs_embeds,)
+            attention_mask_list = (attention_mask,)
 
-            if use_cache and past_key_values_length + inputs_embeds.size(1) == segment_lengths:
-                output_softprompt = True
-
-                # If we use cache and output softprompt, we need to add a dummy segment to the end to get the past key values of the softprompt
-                inputs_embeds_list = (inputs_embeds, inputs_embeds[:,:0,:])
-                attention_mask_list = (attention_mask, attention_mask[:,:0])
-                summary_token_embeds_list = (summary_token_embeds, summary_token_embeds[:,:0,:])
-            else:
-                inputs_embeds_list = (inputs_embeds,)
-                attention_mask_list = (attention_mask,)
-                summary_token_embeds_list = (summary_token_embeds if output_softprompt else summary_token_embeds[:,:0,:],)
-
-        last_hidden_state_list = []
+        text_hidden_state_list = []
         output_attentions_list = []
         output_hidden_states_list = []
+        compression_penalties = []
 
         if softprompt is None:
-            softprompt = inputs_embeds[:,:0,:]
+            softprompt = inputs_embeds[:, :0, :]
 
-        for step, summary_token_embeds in enumerate(summary_token_embeds_list):
+        segments_since_detach = 0
+
+        for step, segment_embeds in enumerate(inputs_embeds_list):
             is_last_step = step == len(inputs_embeds_list) - 1
+            compress_this_segment = self.config.compression_max_len > 0 and (not is_last_step or output_softprompt)
+
             segment_gradient_checkpointing = (
-                getattr(self.config, "segment_gradient_checkpointing", False) and
-                self.training and not is_last_step
+                getattr(self.config, "segment_gradient_checkpointing", False)
+                and self.training
+                and compress_this_segment
             )
 
-            outputs, segment_hidden_states, new_softprompt = self.forward_segment(
-                softprompt.to(inputs_embeds.dtype), inputs_embeds_list[step], summary_token_embeds, attention_mask_list[step],
-                past_key_values, output_hidden_states, use_cache, output_attentions,
-                segment_gradient_checkpointing, past_key_values_softprompt_length)
+            sum_embed = self.get_sum_embedding(segment_embeds.device, segment_embeds.dtype)
+            sum_embed = sum_embed.unsqueeze(0).expand(segment_embeds.size(0), -1, -1)
 
-            last_hidden_state_list.append(segment_hidden_states)
+            if past_key_values_softprompt_length > 0:
+                softprompt_length = 0
+                combined_embeds = torch.cat([segment_embeds, sum_embed], dim=1)
+                attn_mask = torch.cat(
+                    [
+                        torch.ones(
+                            segment_embeds.size(0), past_key_values_softprompt_length, device=segment_embeds.device, dtype=attention_mask_list[step].dtype
+                        ),
+                        attention_mask_list[step],
+                        torch.ones(segment_embeds.size(0), 1, device=segment_embeds.device, dtype=attention_mask_list[step].dtype),
+                    ],
+                    dim=1,
+                )
+            else:
+                softprompt_length = softprompt.size(1)
+                combined_embeds = torch.cat([softprompt, segment_embeds, sum_embed], dim=1)
+                attn_mask = torch.cat(
+                    [
+                        torch.ones(segment_embeds.size(0), softprompt_length, device=segment_embeds.device, dtype=attention_mask_list[step].dtype),
+                        attention_mask_list[step],
+                        torch.ones(segment_embeds.size(0), 1, device=segment_embeds.device, dtype=attention_mask_list[step].dtype),
+                    ],
+                    dim=1,
+                )
 
-            if self.config.accumulate_summary:
-                softprompt = torch.cat([softprompt, new_softprompt], dim=1)
-            elif new_softprompt.size(1) > 0:
-                softprompt = new_softprompt
+            decoder_outputs = self._decoder(
+                combined_embeds,
+                attn_mask,
+                past_key_values,
+                output_hidden_states,
+                use_cache if use_cache is not None else False,
+                output_attentions,
+                softprompt_length,
+                past_key_values_softprompt_length,
+                control_length=0,
+                segment_gradient_checkpointing=segment_gradient_checkpointing,
+            )
 
-            output_attentions_list.append(outputs.attentions)
-            output_hidden_states_list.append(outputs.hidden_states)
+            total_length = decoder_outputs.last_hidden_state.size(1)
+            segment_length = segment_embeds.size(1)
+            segment_hiddens = decoder_outputs.last_hidden_state[:, softprompt_length : softprompt_length + segment_length]
+            text_hidden_state_list.append(segment_hiddens)
 
-            # No past key values after first step
+            output_attentions_list.append(decoder_outputs.attentions)
+            output_hidden_states_list.append(decoder_outputs.hidden_states)
+
+            if compress_this_segment:
+                original_length = softprompt_length + past_key_values_softprompt_length + segment_length
+                new_softprompt, stats = self._compress_context(
+                    decoder_outputs,
+                    attn_mask,
+                    past_key_values_softprompt_length + softprompt_length,
+                    original_length=original_length,
+                    training=self.training,
+                )
+
+                if self.training and stats.get("expected_length") is not None and self.config.compression_lambda > 0:
+                    expected_len = stats["expected_length"].squeeze(-1)
+                    length_penalty = self.config.compression_lambda * (expected_len / max(float(original_length), 1.0))
+                    compression_penalties.append(length_penalty.mean())
+
+                if self.config.recompress_memory:
+                    softprompt = new_softprompt
+                else:
+                    softprompt = torch.cat([softprompt, new_softprompt], dim=1)
+
+                segments_since_detach += 1
+                if segments_since_detach >= max(1, int(getattr(self.config, "truncate_bptt_segments", 1))):
+                    softprompt = softprompt.detach()
+                    segments_since_detach = 0
+            else:
+                softprompt = softprompt
+
             past_key_values = None
             past_key_values_softprompt_length = 0
 
-        # Output past values of last segment
-        past_key_values = outputs.past_key_values
-
-        # Reset placeholder positions
         self.summary_config.reset()
 
-        last_hiddens = torch.cat(last_hidden_state_list, dim=1)
-        logits = self.lm_head(last_hiddens).contiguous()
+        text_hiddens = torch.cat(text_hidden_state_list, dim=1)
+        logits = self.lm_head(text_hiddens).contiguous()
 
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
+            labels = labels[..., : logits.size(1)]
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+            if len(compression_penalties) > 0:
+                loss = loss + sum(compression_penalties)
+        elif len(compression_penalties) > 0:
+            loss = sum(compression_penalties)
 
         output = CausalACOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values={"past_key_values": past_key_values, "softprompt": softprompt},
+            past_key_values=decoder_outputs.past_key_values,
             hidden_states=output_hidden_states_list if output_hidden_states_list[0] is not None else None,
             attentions=output_attentions_list if output_attentions_list[0] is not None else None,
-            softprompt=softprompt,
+            softprompt=softprompt if output_softprompt else None,
         )
 
         if return_dict:
@@ -272,37 +413,51 @@ class AutoCompressorMixin:
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
-        model_inputs = super().prepare_inputs_for_generation(input_ids, past_key_values, attention_mask, inputs_embeds, **kwargs)
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids, past_key_values, attention_mask, inputs_embeds, **kwargs
+        )
         model_inputs["softprompt"] = kwargs.get("softprompt", None)
         model_inputs["segment_lengths"] = kwargs.get("segment_lengths", None)
+        model_inputs["past_key_values_softprompt_length"] = kwargs.get("past_key_values_softprompt_length", 0)
         return model_inputs
+
+    def _update_model_kwargs_for_generation(
+        self, outputs, model_kwargs: Dict[str, torch.Tensor], is_encoder_decoder: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        model_kwargs = super()._update_model_kwargs_for_generation(outputs, model_kwargs, is_encoder_decoder)
+
+        softprompt = getattr(outputs, "softprompt", None)
+        if softprompt is not None:
+            model_kwargs["softprompt"] = softprompt
+            model_kwargs["past_key_values_softprompt_length"] = softprompt.size(1)
+        else:
+            model_kwargs.pop("softprompt", None)
+            model_kwargs.pop("past_key_values_softprompt_length", None)
+
+        return model_kwargs
 
 
 class OPTLearnedPositionalEmbeddingWithPadding(nn.Embedding):
-    """Overwrite the default OPTLearnedPositionalEmbedding to disable position on summary tokens"""
+    """Overwrite the default OPTLearnedPositionalEmbedding to disable position on memory tokens"""
 
     def __init__(self, num_embeddings: int, embedding_dim: int, summary_config: Optional[SummaryConfig] = None):
-        # OPT is set up so that if padding_idx is specified then offset the embedding ids by 2
-        # and adjust num_embeddings appropriately. Other models don't have this hack
         super().__init__(num_embeddings + 2, embedding_dim, padding_idx=1)
-
         self.summary_config = summary_config if summary_config is not None else SummaryConfig()
 
     def forward(self, attention_mask: torch.LongTensor, past_key_values_length: int = 0):
         attention_mask = attention_mask.long()
         bsz = attention_mask.size(0)
 
-        left_placeholder = torch.ones(bsz, self.summary_config.softprompt_length, dtype=torch.long, device=attention_mask.device) # <pad> -> zero vector
-        right_placeholder = torch.ones(bsz, self.summary_config.summary_length, dtype=torch.long, device=attention_mask.device) # <pad> -> zero vector
-
         total_softprompt_length = self.summary_config.softprompt_length + self.summary_config.past_key_values_softprompt_length
-        attention_mask = attention_mask[:, total_softprompt_length : attention_mask.size(1)-self.summary_config.summary_length]
+        left_placeholder = torch.ones(
+            bsz, self.summary_config.softprompt_length, dtype=torch.long, device=attention_mask.device
+        )
+        effective_mask = attention_mask[:, total_softprompt_length :]
+        positions = effective_mask.cumsum(dim=1) * effective_mask + 1
 
-        positions = attention_mask.cumsum(dim=1) * attention_mask + 1
-
-        # cut positions if `past_key_values_length` is > 0
-        positions = positions[:, past_key_values_length - self.summary_config.past_key_values_softprompt_length :]
-        positions = torch.cat([left_placeholder, positions, right_placeholder], dim=1)
+        start = max(past_key_values_length - self.summary_config.past_key_values_softprompt_length, 0)
+        positions = positions[:, start:]
+        positions = torch.cat([left_placeholder, positions], dim=1)
 
         return super().forward(positions)
 
@@ -313,12 +468,10 @@ class OPTAutoCompressorModel(AutoCompressorMixin, OPTForCausalLM):
 
         self.setup_autocompressor(config)
 
-        # Custom positional embeddings
         self.model.decoder.embed_positions = OPTLearnedPositionalEmbeddingWithPadding(
             config.max_position_embeddings, config.hidden_size, summary_config=self.summary_config
         )
 
-        # Initialize weights and apply final processing
         self.post_init()
 
 
@@ -332,9 +485,16 @@ class LlamaAutoCompressorModel(AutoCompressorMixin, LlamaForCausalLM):
 
         self.setup_autocompressor(config)
 
-        # Initialize weights and apply final processing
         self.post_init()
 
     def get_past_key_values_len(self, past_key_values):
-        # modeling_flash_llama has slightly different layout of past key vlaues
-        return 0 if past_key_values is None else past_key_values[0][1]
+        if past_key_values is None:
+            return 0
+        try:
+            v = past_key_values[0][1]
+            if v is None:
+                pkv = past_key_values[0][0]
+                return int(pkv.size(1)) if torch.is_tensor(pkv) else 0
+            return int(v)
+        except Exception:
+            return 0
