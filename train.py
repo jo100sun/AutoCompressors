@@ -136,9 +136,9 @@ def main():
         )
 
     special_tokens = []
-    if tokenizer.convert_tokens_to_ids("<sum>") is None:
+    if "<sum>" not in tokenizer.get_vocab():
         special_tokens.append("<sum>")
-    if tokenizer.convert_tokens_to_ids("<eoc>") is None:
+    if "<eoc>" not in tokenizer.get_vocab():
         special_tokens.append("<eoc>")
     if special_tokens:
         tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})

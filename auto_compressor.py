@@ -126,11 +126,12 @@ class AutoCompressorMixin:
 
             logits_hist.append(logits)
             p_hist.append(p_t)
-            survival_hist.append(survival)
 
             if training:
-                gated_memory.append((survival.unsqueeze(-1) * z_t).unsqueeze(1))
-                survival = survival * (1 - p_t)
+                continuation = survival * (1 - p_t)
+                gated_memory.append((continuation.unsqueeze(-1) * z_t).unsqueeze(1))
+                survival_hist.append(continuation)
+                survival = continuation
             else:
                 stop_decision = (
                     (self.config.compress_stop_threshold is not None and p_t > self.config.compress_stop_threshold)
