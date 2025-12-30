@@ -10,8 +10,8 @@ save_steps=${SAVE:-1000}
 num_gpus=${NUM_GPUS:-1}
 segments_per_substep=${SEG:-2}
 training_substeps=${SUB:-2}
-summary_length=${SUM:-50}
-summary_accumulation=${ACC:-true}
+compression_max_len=${COMP:-64}
+compression_lambda=${LAMBDA:-0.0}
 randomize_substeps=${RAND:-true}
 segment_gradient_checkpointing=${CHECK:-false}
 num_train_epochs=1
@@ -24,12 +24,9 @@ eval_domains=(Books3 Github FreeLaw Wikipedia Gutenberg HackerNews ArXiv Youtube
 total_per_device=$((${total}/${num_gpus}))
 accu=$(( ${total_per_device} / ${bs} ))
 
-run_name_suffix="sub${training_substeps}_seg${segments_per_substep}_sum${summary_length}_lr${lr}_bsz${total}"
+run_name_suffix="sub${training_substeps}_seg${segments_per_substep}_comp${compression_max_len}_lr${lr}_bsz${total}"
 if [[ ${randomize_substeps} == true ]]; then
     run_name_suffix+="_rand"
-fi
-if [[ $summary_accumulation == true ]]; then
-    run_name_suffix+="_accu"
 fi
 if [[ ${segment_gradient_checkpointing} == true ]]; then
     run_name+="_check"
@@ -80,8 +77,8 @@ arguments=(
     --learning_rate $lr
     --run_name $run_name
     --output_dir $out_dir
-    --summary_length $summary_length
-    --accumulate_summary $summary_accumulation
+    --compression_max_len $compression_max_len
+    --compression_lambda $compression_lambda
     --remove_unused_columns false
     --segments_per_substep $segments_per_substep
     --training_substeps $training_substeps

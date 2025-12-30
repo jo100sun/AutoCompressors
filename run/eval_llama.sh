@@ -13,7 +13,7 @@
 nvidia-smi
 conda activate auto
 base_model=${BASE:-"Llama-2-7b-hf"}
-run_name=${NAME:-"ac_Llama-2-7b-hf_sub2_seg2_sum50_lr4e-4_bsz32_rand_accu/checkpoint-65000"}    # use llama-2-7b-hf for base model
+run_name=${NAME:-"ac_Llama-2-7b-hf_sub2_seg2_comp64_lr4e-4_bsz32_rand/checkpoint-65000"}    # use llama-2-7b-hf for base model
 block_size=${BLOCK:-8192}
 
 total=${BATCH:-32}      # total batch size
@@ -23,8 +23,7 @@ warmup_steps=${WU:-5000}
 save_steps=${SAVE:-5000}
 segments_per_substep=${SEG:-2}
 training_substeps=${SUB:-1}
-summary_length=${SUM:-50}
-summary_accumulation=${ACC:-true}
+compression_max_len=${COMP:-64}
 randomize_substeps=${RAND:-false}
 num_train_epochs=1
 segment_lengths=${SEGLEN:-"2048 2048"}
@@ -90,8 +89,7 @@ arguments=(
     --learning_rate $lr
     --output_dir $out_dir
     --use_fast_tokenizer false
-    --summary_length $summary_length
-    --accumulate_summary $summary_accumulation
+    --compression_max_len $compression_max_len
     --remove_unused_columns false
     --segments_per_substep $segments_per_substep
     --training_substeps $training_substeps

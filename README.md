@@ -30,7 +30,7 @@ context_tokens = tokenizer(context, add_special_tokens=False, return_tensors="pt
 
 summary_vectors = model(context_tokens, output_softprompt=True).softprompt
 print(f"Compressing {context_tokens.size(1)} tokens to {summary_vectors.size(1)} summary vectors")
-# >>> Compressing 660 tokens to 50 summary vectors
+# >>> Compressing 660 tokens to 64 summary vectors
 
 generation_with_summary_vecs = model.generate(prompt_tokens, do_sample=False, softprompt=summary_vectors, max_new_tokens=12)[0]
 print("Generation w/ summary vectors:\n" + tokenizer.decode(generation_with_summary_vecs))
@@ -40,6 +40,16 @@ next_tokens_without_context = model.generate(prompt_tokens, do_sample=False, max
 print("Generation w/o context:\n" + tokenizer.decode(next_tokens_without_context))
 # >>> The first name of the current US president is "Donald" and the last name is "Trump".
 ```
+
+### Variable-length compression and control tokens
+The new AutoCompressor architecture exposes two additional control tokens that are automatically added to the tokenizer and model embedding table during training:
+
+* `<sum>`: an externally injected trigger that asks the model to enter compression mode after a segment.
+* `<eoc>`: a compression termination signal that is **separate** from `<eos>`.
+
+During training, every segment is processed with the current continuous memory prepended as a soft prompt; `<sum>` is appended internally and the model unrolls `compression_max_len` compression steps. At each step *t*, the model produces a continuous vector `z_t` (the last hidden state for that step) and a probability `p_t = P(<eoc>)`. A differentiable termination gate keeps a survival score `s_1 = 1, s_{t+1} = s_t (1 - p_t)` and the memory handed to the next segment is `[s_1 z_1, …, s_{L_max} z_{L_max}]`. A length regularizer `compression_lambda * E[L] / (softprompt_len + segment_len)` encourages early termination, where `E[L] = \sum_t s_t` and `softprompt_len + segment_len` measures the pre-compression context length.
+
+At inference time the compression loop runs until either `<eoc>` is produced (the terminating step is *not* appended to memory) or `compression_max_len` is reached. Memory is recomputed after each segment (`recompress_memory=True` by default) and can be detached every `truncate_bptt_segments` compressed segments to bound backpropagation.
 
 ### Install
 Setup a new environment and install [pytorch](https://pytorch.org/) version 2.1.0,
