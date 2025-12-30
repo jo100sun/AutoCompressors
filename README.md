@@ -97,11 +97,18 @@ tokenizer = AutoTokenizer.from_pretrained("princeton-nlp/AutoCompressor-2.7b-6k"
 model = OPTAutoCompressorModel.from_pretrained("princeton-nlp/AutoCompressor-2.7b-6k")
 ```
 
-### Summary Vectors
+### Variable-Length AutoCompressors
 
-The summary vectors for a given context can be obtained in two ways:
-1. **Explicitly:** Call the model with `out = model(input_ids, attention_mask, ..., output_softprompt=True)` and obtain the summary vectors as `summary_vectors = out.softprompt` which can be passed to further calls by `model(..., softprompt=sumary_vectors)`.
-2. **Implicitly:** Call the model with `out = model(input_ids, segment_lengths=segment_lengths)`, where `segment_lengths` is a list of integers that should add up to the overall sequence length `input_ids.size(1)`. After each segment, the model will automatically generate the summary vectors and prepend them to the next segment. This can still be combined with `output_softprompt=True` to generate the final summary vectors for the entire input. This is convenient for multi-step compression of long inputs, which would otherwise exceed the model's maximum position.
+AutoCompressors now support a **variable-length compression mode** triggered by two new special tokens:
+
+- `<sum>`: injected by the controller at the end of a segment to start compression.
+- `<eoc>`: emitted by the model to terminate compression (distinct from `<eos>`).
+
+During training, compression always unrolls `compression_max_len` steps and computes a differentiable length penalty based on the expected stop position of `<eoc>`. At inference, compression runs in a manual loop until `<eoc>` is produced, and the resulting continuous vectors are used as the soft prompt for the next segment.
+
+To obtain summary vectors:
+1. **Explicitly:** Call the model with `out = model(input_ids, attention_mask, ..., output_softprompt=True)` and obtain the summary vectors as `summary_vectors = out.softprompt`.
+2. **Segmented:** Call the model with `out = model(input_ids, segment_lengths=segment_lengths)`, where `segment_lengths` lists the token counts of each segment (tokens are expected to include an injected `<sum>` after each segment). Compression will recompute memory after each `<sum>` and prepend the resulting soft prompt to the next segment.
 
 ## Bug or Questions?
 If you have any questions related to the code or the paper, feel free to email
