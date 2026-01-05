@@ -46,11 +46,9 @@ class AutoCompressorMixin:
         self.summary_config = SummaryConfig()
 
         if config.summary_length > 0:
-            self.embed_summary = nn.Embedding(config.summary_length, self.get_input_embeddings().embedding_dim)
-
             input_embeds = self.get_input_embeddings()
-            self.embed_summary.weight.data[:,:] = (
-                input_embeds.weight[config.eos_token_id]
+            self.embed_summary = nn.Parameter(
+                input_embeds.weight[config.eos_token_id].detach().clone()
             )
 
     def forward_segment(
@@ -167,8 +165,7 @@ class AutoCompressorMixin:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
         if self.config.summary_length > 0:
-            summary_token_ids = torch.arange(self.config.summary_length, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0).expand(inputs_embeds.size(0), -1)
-            summary_token_embeds = self.embed_summary(summary_token_ids).to(inputs_embeds.dtype)
+            summary_token_embeds = self.embed_summary.to(inputs_embeds.dtype).unsqueeze(0).unsqueeze(1).expand(inputs_embeds.size(0), 1, -1)
         else:
             summary_token_embeds = inputs_embeds[:,:0]
 
@@ -183,10 +180,6 @@ class AutoCompressorMixin:
 
             inputs_embeds_list = torch.split(inputs_embeds, segment_lengths, dim=1)
             attention_mask_list = torch.split(attention_mask, segment_lengths, dim=1)
-            summary_token_embeds_list = (
-                (summary_token_embeds,) * (len(inputs_embeds_list) - 1) +
-                (summary_token_embeds if output_softprompt else summary_token_embeds[:,:0,:],)
-            )
         # With past_key_values we will process the input in a single pass (for generation), except when generting summary vectors
         else:
             if attention_mask is None:
@@ -200,11 +193,9 @@ class AutoCompressorMixin:
                 # If we use cache and output softprompt, we need to add a dummy segment to the end to get the past key values of the softprompt
                 inputs_embeds_list = (inputs_embeds, inputs_embeds[:,:0,:])
                 attention_mask_list = (attention_mask, attention_mask[:,:0])
-                summary_token_embeds_list = (summary_token_embeds, summary_token_embeds[:,:0,:])
             else:
                 inputs_embeds_list = (inputs_embeds,)
                 attention_mask_list = (attention_mask,)
-                summary_token_embeds_list = (summary_token_embeds if output_softprompt else summary_token_embeds[:,:0,:],)
 
         last_hidden_state_list = []
         output_attentions_list = []
@@ -213,23 +204,28 @@ class AutoCompressorMixin:
         if softprompt is None:
             softprompt = inputs_embeds[:,:0,:]
 
-        for step, summary_token_embeds in enumerate(summary_token_embeds_list):
+        summary_placeholder = summary_token_embeds
+        for step in range(len(inputs_embeds_list)):
             is_last_step = step == len(inputs_embeds_list) - 1
             segment_gradient_checkpointing = (
                 getattr(self.config, "segment_gradient_checkpointing", False) and
                 self.training and not is_last_step
             )
 
+            need_summary = not (is_last_step and not output_softprompt)
+            if need_summary:
+                current_summary = softprompt[:, -1:, :].to(inputs_embeds.dtype) if softprompt.size(1) > 0 else summary_placeholder.to(inputs_embeds.dtype)
+            else:
+                current_summary = summary_placeholder[:,:0,:]
+
             outputs, segment_hidden_states, new_softprompt = self.forward_segment(
-                softprompt.to(inputs_embeds.dtype), inputs_embeds_list[step], summary_token_embeds, attention_mask_list[step],
+                softprompt.to(inputs_embeds.dtype), inputs_embeds_list[step], current_summary, attention_mask_list[step],
                 past_key_values, output_hidden_states, use_cache, output_attentions,
                 segment_gradient_checkpointing, past_key_values_softprompt_length)
 
             last_hidden_state_list.append(segment_hidden_states)
 
-            if self.config.accumulate_summary:
-                softprompt = torch.cat([softprompt, new_softprompt], dim=1)
-            elif new_softprompt.size(1) > 0:
+            if new_softprompt.size(1) > 0:
                 softprompt = new_softprompt
 
             output_attentions_list.append(outputs.attentions)
