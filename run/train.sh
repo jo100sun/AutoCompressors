@@ -1,7 +1,7 @@
 nvidia-smi
 
 # You can override the default parameters by passing variables to the script
-base_model=${BASE:-"opt-2.7b"}
+base_model=${BASE:-"opt-125m"}
 total=${BATCH:-16}      # total batch size
 bs=${SEQ:-1}            # batch size per device
 lr=${LR:-2e-5}
@@ -10,7 +10,7 @@ save_steps=${SAVE:-1000}
 num_gpus=${NUM_GPUS:-1}
 segments_per_substep=${SEG:-2}
 training_substeps=${SUB:-2}
-compression_max_len=${CML:-8}
+compression_max_len=${CML:-50}
 compression_lambda=${CLAMBDA:-0.0}
 compression_alpha=${CALPHA:-1.0}
 truncate_bptt_segments=${TBPTT:-1}
@@ -19,8 +19,10 @@ randomize_substeps=${RAND:-true}
 segment_gradient_checkpointing=${CHECK:-false}
 num_train_epochs=1
 
-train_domains=(Books3 Github FreeLaw Wikipedia)
-eval_domains=(Books3 Github FreeLaw Wikipedia Gutenberg HackerNews ArXiv YoutubeSubtitles)
+train_domains=(Books3)
+# Github FreeLaw Wikipedia)
+eval_domains=(Books3)
+# Github FreeLaw Wikipedia Gutenberg HackerNews ArXiv YoutubeSubtitles)
 
 ################################
 

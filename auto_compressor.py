@@ -103,9 +103,9 @@ class AutoCompressorMixin:
         def step_attention_mask(past_len: int):
             return torch.ones(batch_size, past_len + 1, device=device, dtype=torch.long)
 
-        past_total_len = self.get_past_key_values_len(past)
-
-        for _ in range(self.config.compression_max_len):
+        for i in range(self.config.compression_max_len+1):
+            if i == 0:
+                z_prev = self.get_input_embeddings()(self.config.sum_token_id * torch.ones(batch_size, 1, dtype=torch.int32, device=device))
             attn_mask = step_attention_mask(past_total_len)
             self.summary_config.softprompt_length = 0
             self.summary_config.past_key_values_softprompt_length = memory_length
@@ -128,10 +128,9 @@ class AutoCompressorMixin:
             p_hist.append(p_t)
 
             if training:
-                continuation = survival * (1 - p_t)
-                gated_memory.append((continuation.unsqueeze(-1) * z_t).unsqueeze(1))
-                survival_hist.append(continuation)
-                survival = continuation
+                gated_memory.append((survival.unsqueeze(-1) * z_t).unsqueeze(1))
+                survival_hist.append(survival)
+                #survival = survival * (1 - p_t)
             else:
                 stop_decision = (
                     (self.config.compress_stop_threshold is not None and p_t > self.config.compress_stop_threshold)
