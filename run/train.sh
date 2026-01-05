@@ -4,7 +4,7 @@ nvidia-smi
 base_model=${BASE:-"opt-125m"}
 total=${BATCH:-16}      # total batch size
 bs=${SEQ:-1}            # batch size per device
-lr=${LR:-2e-5}
+lr=${LR:-2e-6}
 warmup_steps=${WU:-1000}
 save_steps=${SAVE:-1000}
 num_gpus=${NUM_GPUS:-1}
@@ -13,9 +13,10 @@ training_substeps=${SUB:-2}
 compression_max_len=${CML:-50}
 compression_lambda=${CLAMBDA:-0.0}
 compression_alpha=${CALPHA:-1.0}
-truncate_bptt_segments=${TBPTT:-1}
+truncate_bptt_segments=${TBPTT:-2}
 compress_stop_threshold=${CSTOP:-}
-randomize_substeps=${RAND:-true}
+randomize_substeps=${RAND:-false}
+segment_lengths=${SEGLEN:-1536,1536}
 segment_gradient_checkpointing=${CHECK:-false}
 num_train_epochs=1
 

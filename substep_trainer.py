@@ -51,6 +51,7 @@ class DataCollator:
 
             # Only add <sum> tokens if we have fixed segment lengths (not randomized)
             if not randomize_substeps and segment_lengths:
+                print(f"Using fixed segment lengths: {segment_lengths}")
                 # Strategy: Insert <sum> at EVERY segment boundary for recompression memory
                 # This implements the core AutoCompressor policy where M is replaced after
                 # every segment. BPTT (truncate_bptt_segments) controls gradient flow via
@@ -339,7 +340,7 @@ class SubstepTrainer(BaseTrainer):
 
     def segment_input(self, inputs, substep):
         """Returns the sliced inputs and the random segment lengths when randomize_substeps=True"""
-        
+        self.args.segment_lengths = [1536, 1536]
         # if using segment_lenghts, keep only the end segment of the inputs. This is useful for evaluation. During training, segment lengths should sum to the total block_size
         if not self.args.randomize_substeps:
             total_length = sum(self.args.segment_lengths) * self.args.training_substeps

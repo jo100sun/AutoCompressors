@@ -392,7 +392,7 @@ class AutoCompressorMixin:
             segment_labels = labels_list[step]
 
             if self.config.truncate_bptt_segments == 1 and softprompt_detach_flag and softprompt is not None:
-                softprompt = softprompt.detach()
+                #softprompt = softprompt.detach()
                 softprompt_detach_flag = False
 
             bsz = segment_embeds.size(0)
