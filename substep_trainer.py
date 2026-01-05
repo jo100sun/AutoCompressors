@@ -32,17 +32,63 @@ class DataCollator:
         self.tokenizer = tokenizer
         self.additional_args = additional_args
         self.pad_token_id = self.tokenizer.bos_token_id
+        # Get <sum> token ID for inserting at segment boundaries
+        self.sum_token_id = tokenizer.convert_tokens_to_ids("<sum>")
 
     def __call__(self, features: Any) -> Dict[str, Any]:
         bsz = len(features)
-        max_length = max(len(feature["input_ids"]) for feature in features)
-        # max_length = self.max_length
+
+        # Get segment lengths from training args
+        segment_lengths = self.additional_args.segment_lengths
+        training_substeps = self.additional_args.training_substeps
+        randomize_substeps = self.additional_args.randomize_substeps
+
+        # Process each feature to insert <sum> tokens at segment boundaries
+        processed_features = []
+        for feature in features:
+            input_ids = feature["input_ids"]
+
+            # Only add <sum> tokens if we have fixed segment lengths (not randomized)
+            if not randomize_substeps and segment_lengths:
+                # Strategy: REPLACE the last token of each segment with <sum>
+                # This keeps segment lengths constant
+                new_input_ids = []
+                total_segment_length = sum(segment_lengths)
+                num_complete_substeps = len(input_ids) // (total_segment_length * training_substeps)
+
+                pos = 0
+                for _ in range(num_complete_substeps * training_substeps):
+                    for seg_len in segment_lengths:
+                        if pos + seg_len <= len(input_ids):
+                            # Take seg_len-1 tokens, then add <sum>
+                            new_input_ids.extend(input_ids[pos:pos + seg_len - 1])
+                            new_input_ids.append(self.sum_token_id)
+                            pos += seg_len
+                        else:
+                            # Not enough tokens for a complete segment
+                            new_input_ids.extend(input_ids[pos:])
+                            pos = len(input_ids)
+                            break
+
+                # Add any remaining tokens without modification
+                if pos < len(input_ids):
+                    new_input_ids.extend(input_ids[pos:])
+
+                input_ids = new_input_ids
+
+            processed_features.append({
+                "input_ids": input_ids,
+                "attention_mask": [1] * len(input_ids),
+                "labels": input_ids.copy()
+            })
+
+        max_length = max(len(f["input_ids"]) for f in processed_features)
 
         input_ids = torch.full((bsz, max_length), self.pad_token_id, dtype=torch.long)
         attention_mask = torch.zeros(bsz, max_length, dtype=torch.long)
         labels = torch.full((bsz, max_length), -100, dtype=torch.long)
 
-        for i, feature in enumerate(features):
+        for i, feature in enumerate(processed_features):
             input_ids[i, :len(feature["input_ids"])] = torch.tensor(feature["input_ids"], dtype=torch.long)
             attention_mask[i, :len(feature["input_ids"])] = torch.tensor(feature["attention_mask"], dtype=torch.long)
             labels[i, :len(feature["input_ids"])] = torch.tensor(feature["labels"], dtype=torch.long)
