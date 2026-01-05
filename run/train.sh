@@ -1,35 +1,38 @@
 nvidia-smi
 
 # You can override the default parameters by passing variables to the script
-base_model=${BASE:-"opt-2.7b"}
+base_model=${BASE:-"opt-125m"}
 total=${BATCH:-16}      # total batch size
 bs=${SEQ:-1}            # batch size per device
-lr=${LR:-2e-5}
+lr=${LR:-2e-6}
 warmup_steps=${WU:-1000}
 save_steps=${SAVE:-1000}
 num_gpus=${NUM_GPUS:-1}
 segments_per_substep=${SEG:-2}
 training_substeps=${SUB:-2}
-summary_length=${SUM:-50}
-summary_accumulation=${ACC:-true}
-randomize_substeps=${RAND:-true}
+compression_max_len=${CML:-50}
+compression_lambda=${CLAMBDA:-0.0}
+compression_alpha=${CALPHA:-1.0}
+truncate_bptt_segments=${TBPTT:-2}
+compress_stop_threshold=${CSTOP:-}
+randomize_substeps=${RAND:-false}
+segment_lengths=${SEGLEN:-1536,1536}
 segment_gradient_checkpointing=${CHECK:-false}
 num_train_epochs=1
 
-train_domains=(Books3 Github FreeLaw Wikipedia)
-eval_domains=(Books3 Github FreeLaw Wikipedia Gutenberg HackerNews ArXiv YoutubeSubtitles)
+train_domains=(Books3)
+# Github FreeLaw Wikipedia)
+eval_domains=(Books3)
+# Github FreeLaw Wikipedia Gutenberg HackerNews ArXiv YoutubeSubtitles)
 
 ################################
 
 total_per_device=$((${total}/${num_gpus}))
 accu=$(( ${total_per_device} / ${bs} ))
 
-run_name_suffix="sub${training_substeps}_seg${segments_per_substep}_sum${summary_length}_lr${lr}_bsz${total}"
+run_name_suffix="sub${training_substeps}_seg${segments_per_substep}_cml${compression_max_len}_lr${lr}_bsz${total}"
 if [[ ${randomize_substeps} == true ]]; then
     run_name_suffix+="_rand"
-fi
-if [[ $summary_accumulation == true ]]; then
-    run_name_suffix+="_accu"
 fi
 if [[ ${segment_gradient_checkpointing} == true ]]; then
     run_name+="_check"
@@ -80,8 +83,10 @@ arguments=(
     --learning_rate $lr
     --run_name $run_name
     --output_dir $out_dir
-    --summary_length $summary_length
-    --accumulate_summary $summary_accumulation
+    --compression_max_len $compression_max_len
+    --compression_lambda $compression_lambda
+    --compression_alpha $compression_alpha
+    --truncate_bptt_segments $truncate_bptt_segments
     --remove_unused_columns false
     --segments_per_substep $segments_per_substep
     --training_substeps $training_substeps
@@ -90,6 +95,10 @@ arguments=(
     --bf16
     $@
 )
+
+if [[ -n "$compress_stop_threshold" ]]; then
+    arguments+=(--compress_stop_threshold $compress_stop_threshold)
+fi
 
 echo "Training on 6K token sequences"
 arguments+=(--preprocessed_train_datasets)

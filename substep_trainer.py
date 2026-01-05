@@ -32,17 +32,69 @@ class DataCollator:
         self.tokenizer = tokenizer
         self.additional_args = additional_args
         self.pad_token_id = self.tokenizer.bos_token_id
+        # Get <sum> token ID for inserting at segment boundaries
+        self.sum_token_id = tokenizer.convert_tokens_to_ids("<sum>")
 
     def __call__(self, features: Any) -> Dict[str, Any]:
         bsz = len(features)
-        max_length = max(len(feature["input_ids"]) for feature in features)
-        # max_length = self.max_length
+
+        # Get segment lengths from training args
+        segment_lengths = self.additional_args.segment_lengths
+        training_substeps = self.additional_args.training_substeps
+        randomize_substeps = self.additional_args.randomize_substeps
+        truncate_bptt_segments = self.additional_args.truncate_bptt_segments
+
+        # Process each feature to insert <sum> tokens at segment boundaries
+        processed_features = []
+        for feature in features:
+            input_ids = feature["input_ids"]
+
+            # Only add <sum> tokens if we have fixed segment lengths (not randomized)
+            if not randomize_substeps and segment_lengths:
+                print(f"Using fixed segment lengths: {segment_lengths}")
+                # Strategy: Insert <sum> at EVERY segment boundary for recompression memory
+                # This implements the core AutoCompressor policy where M is replaced after
+                # every segment. BPTT (truncate_bptt_segments) controls gradient flow via
+                # detachment, not compression frequency.
+                new_input_ids = []
+                total_segment_length = sum(segment_lengths)
+                num_complete_substeps = len(input_ids) // (total_segment_length * training_substeps)
+
+                pos = 0
+
+                for _ in range(num_complete_substeps * training_substeps):
+                    for seg_len in segment_lengths:
+                        if pos + seg_len <= len(input_ids):
+                            # Always replace the last token of each segment with <sum>
+                            # This triggers compression and memory recompression
+                            new_input_ids.extend(input_ids[pos:pos + seg_len - 1])
+                            new_input_ids.append(self.sum_token_id)
+                            pos += seg_len
+                        else:
+                            # Not enough tokens for a complete segment
+                            new_input_ids.extend(input_ids[pos:])
+                            pos = len(input_ids)
+                            break
+
+                # Add any remaining tokens without modification
+                if pos < len(input_ids):
+                    new_input_ids.extend(input_ids[pos:])
+
+                input_ids = new_input_ids
+
+            processed_features.append({
+                "input_ids": input_ids,
+                "attention_mask": [1] * len(input_ids),
+                "labels": input_ids.copy()
+            })
+
+        max_length = max(len(f["input_ids"]) for f in processed_features)
 
         input_ids = torch.full((bsz, max_length), self.pad_token_id, dtype=torch.long)
         attention_mask = torch.zeros(bsz, max_length, dtype=torch.long)
         labels = torch.full((bsz, max_length), -100, dtype=torch.long)
 
-        for i, feature in enumerate(features):
+        for i, feature in enumerate(processed_features):
             input_ids[i, :len(feature["input_ids"])] = torch.tensor(feature["input_ids"], dtype=torch.long)
             attention_mask[i, :len(feature["input_ids"])] = torch.tensor(feature["attention_mask"], dtype=torch.long)
             labels[i, :len(feature["input_ids"])] = torch.tensor(feature["labels"], dtype=torch.long)
@@ -156,13 +208,42 @@ class SubstepTrainer(BaseTrainer):
         softprompt: Optional[torch.FloatTensor] = None,
         segment_lengths = None
         ) -> torch.Tensor:
-        """Performs a training substep, after which softprompts are detached and gradients are accumulated"""
+        """Performs a training substep with gradient accumulation and softprompt detachment.
+
+        This implements one step of truncated backpropagation through time (BPTT):
+        1. Forward pass through multiple segments with compression
+        2. Compute loss (text CE + length penalty)
+        3. Backward pass (gradients accumulate across substeps)
+        4. DETACH softprompt to truncate gradient flow to previous substeps
+
+        The softprompt detachment is CRITICAL for BPTT:
+        - Gradients flow through compression into the current substep's segments
+        - Gradients are BLOCKED from flowing to previous substeps via detached softprompt
+        - This keeps memory bounded while still allowing learning of compression
+
+        Args:
+            model: AutoCompressor model
+            inputs: Batch inputs (input_ids, attention_mask, labels)
+            softprompt: Memory from previous substep (will be detached in model forward if BPTT=1)
+            segment_lengths: List of segment lengths for splitting input
+
+        Returns:
+            loss: Detached loss tensor (for logging)
+            softprompt: Detached softprompt for next substep (gradient flow truncated)
+        """
 
         model.train()
         inputs = self._prepare_inputs(inputs)
         with self.compute_loss_context_manager():
+            # Forward pass through segments with compression
+            # - softprompt is prepended to each segment
+            # - Each segment ending with <sum> triggers compression
+            # - New softprompt is generated via compress_context()
             out = model(**inputs, softprompt=softprompt, segment_lengths=segment_lengths, use_cache=False, output_softprompt=True)
             loss = out.loss
+
+            # CRITICAL: Detach softprompt to prevent gradients from flowing to previous substep
+            # This is the key to truncated BPTT - gradient flow stops here
             softprompt = out.softprompt.detach()
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -183,10 +264,38 @@ class SubstepTrainer(BaseTrainer):
         return loss.detach(), softprompt
 
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
-        """One training step consists of many training_substeps.
+        """One training step consists of multiple training substeps with gradient accumulation.
 
-        Note that gradient_accumulation_steps is still measured in full training steps,
-        although substeps also implicitly accumulated gradient."""
+        TRAINING FLOW:
+        1. Split full input sequence into substeps (each substep has multiple segments)
+        2. For each substep:
+           a. Forward pass through segments (with memory from previous substep)
+           b. Compression triggered at end of each segment (<sum> token)
+           c. Backward pass (gradients accumulate)
+           d. Detach memory to truncate BPTT
+        3. After all substeps, optimizer step is performed (if gradient_accumulation_steps reached)
+
+        GRADIENT FLOW:
+        - Within a substep: Gradients flow through all segments and compression loops
+        - Across substeps: Gradients are BLOCKED by softprompt detachment
+        - This implements truncated BPTT, keeping memory bounded
+
+        EXAMPLE (training_substeps=2, segments_per_substep=2):
+        - Substep 0: Seg0 -> compress -> M0, Seg1 -> compress -> M1 (M0 detached by model)
+        - Substep 1: M1 (detached) + Seg2 -> compress -> M2, Seg3 -> compress -> M3
+        - Gradients flow: Seg1->Compression->M1->Seg2 (within/across substeps)
+        - Gradients STOP at detached M1 (don't reach Seg0)
+
+        Note: gradient_accumulation_steps is measured in full training steps, and substeps
+        also implicitly accumulate gradients within each training step.
+
+        Args:
+            model: AutoCompressor model
+            inputs: Full batch inputs (will be split into substeps)
+
+        Returns:
+            total_loss: Average loss across all substeps
+        """
 
         total_loss = 0
         softprompt=None
@@ -231,7 +340,7 @@ class SubstepTrainer(BaseTrainer):
 
     def segment_input(self, inputs, substep):
         """Returns the sliced inputs and the random segment lengths when randomize_substeps=True"""
-        
+        self.args.segment_lengths = [1536, 1536]
         # if using segment_lenghts, keep only the end segment of the inputs. This is useful for evaluation. During training, segment lengths should sum to the total block_size
         if not self.args.randomize_substeps:
             total_length = sum(self.args.segment_lengths) * self.args.training_substeps
